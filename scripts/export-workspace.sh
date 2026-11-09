@@ -37,6 +37,12 @@ fi
 # export INPUTS_CLI_CALLER=/path/to/node_modules/.bin/rhdh-cli
 INPUTS_CLI_CALLER=${INPUTS_CLI_CALLER:-"npx --yes ${INPUTS_CLI_PACKAGE}@${INPUTS_CLI_VERSION}"}
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=export-dynamic/pack-dist-dynamic.sh
+source "${SCRIPT_DIR}/pack-dist-dynamic.sh"
+# shellcheck source=export-dynamic/validate-plugin-payload.sh
+source "${SCRIPT_DIR}/validate-plugin-payload.sh"
+
 # Check local installation first, then fall back to npx --yes (requires network)
 run_cli() {
     local cli_args=("$@")
@@ -89,15 +95,17 @@ if [[ "${skipWorkspace}" == "true" ]]
 then
     echo "Skipping workspace since it didn't change since last published commit (${INPUTS_LAST_PUBLISH_COMMIT})"
 else
-    if [[ -f "${workspaceOverlayFolder}/backstage.json" ]]
-    then
-        echo "Overriding backstage.json file before exporting plugins to override the supportedVersions package field."
-        if [[ -f "backstage.json" ]]
-        then
-            cp -fv "backstage.json" "backstage.json.save"
-            trap "mv -fv 'backstage.json.save' 'backstage.json'" EXIT
+    overlay_backstage_json="${workspaceOverlayFolder}/backstage.json"
+    overlay_supported_version=""
+    if [[ -f "$overlay_backstage_json" ]]; then
+        overlay_supported_version=$(jq -r '.version' "$overlay_backstage_json")
+        if [[ "$overlay_supported_version" == "null" ]]; then
+            overlay_supported_version=""
         fi
-        cp -fv "${workspaceOverlayFolder}/backstage.json" "backstage.json"
+    fi
+
+    if [[ -n "${INPUTS_IMAGE_REPOSITORY_PREFIX}" ]]; then
+        _require_skopeo
     fi
 
     # We use '|| [[ -n "$plugin" ]]' to catch the last line even if it lacks a newline.
@@ -120,6 +128,11 @@ else
         # shellcheck disable=SC2001
         args=$(echo "$plugin" | sed 's/^\(^[^:]*\): *\(.*\)$/\2/')
         
+        # check if folder exists; if not, skip this package
+        if [ ! -d "$pluginPath" ]; then
+            echo "Skip missing package folder $pluginPath"
+            continue
+        fi
         pushd "$pluginPath" > /dev/null
         
         if [[ "$(grep -e '"role" *: *"frontend-plugin' package.json)" != "" ]]
@@ -150,9 +163,34 @@ else
             popd > /dev/null
             continue
         fi
+
+        if [[ -n "$overlay_supported_version" ]] && [[ -f "dist-dynamic/package.json" ]]; then
+            echo "  Setting supported-versions to ${overlay_supported_version} from overlay backstage.json"
+            jq --arg ver "$overlay_supported_version" \
+               '.backstage["supported-versions"] = $ver' \
+               dist-dynamic/package.json > dist-dynamic/package.json.tmp \
+               && mv dist-dynamic/package.json.tmp dist-dynamic/package.json
+        fi
+
+        # Validate backstage.features for frontend plugins (NFS readiness)
+        if [[ "$pluginType" == "frontend" ]] && [[ -f "dist-dynamic/package.json" ]]; then
+            features=$(jq -c '.backstage.features // {}' dist-dynamic/package.json 2>/dev/null || echo '{}')
+            if [[ "$features" == "{}" || "$features" == "null" || -z "$features" ]]; then
+                echo "  ⚠️  backstage.features is missing or empty — plugin may not be NFS-ready"
+            else
+                echo "  ✅ backstage.features: $features"
+            fi
+        fi
+
+        if ! assert_dist_dynamic_payload "$(pwd)/dist-dynamic"; then
+            echo " Error: empty or incomplete dist-dynamic export for ${pluginPath}"
+            errors+=("${pluginPath}")
+            set -e
+            popd > /dev/null
+            continue
+        fi
         echo
 
-        # package the dynamic plugin in a container image
         if [[ "${INPUTS_IMAGE_REPOSITORY_PREFIX}" != "" ]]
         then
             PLUGIN_NAME=$(jq -r '.name | sub("^@"; "") | sub("[/@]"; "-")' package.json)
@@ -161,7 +199,10 @@ else
 
             echo "========== Packaging Container ${PLUGIN_CONTAINER_TAG} =========="
             if run_cli "${PACKAGE_COMMAND[@]}" --tag "${PLUGIN_CONTAINER_TAG}"; then
-                if [[ "${INPUTS_PUSH_CONTAINER_IMAGE}" == "true" ]]
+                if ! assert_local_plugin_image "${PLUGIN_CONTAINER_TAG}"; then
+                    echo " Error: packaged image has no installable payload for ${pluginPath}"
+                    errors+=("${pluginPath}")
+                elif [[ "${INPUTS_PUSH_CONTAINER_IMAGE}" == "true" ]]
                 then
                     echo "========== Publishing Container ${PLUGIN_CONTAINER_TAG} =========="
                     if ${INPUTS_CONTAINER_BUILD_TOOL} push "$PLUGIN_CONTAINER_TAG"; then
@@ -187,8 +228,8 @@ else
             packDestination=${INPUTS_DESTINATION}
             mkdir -pv "${packDestination}"
 
-            echo "  running npm pack on the exported './dist-dynamic' sub-folder"
-            if ! json=$(npm pack ./dist-dynamic --pack-destination "$packDestination" --json); then
+            echo "  running npm pack on a hardlink-free copy of './dist-dynamic'"
+            if ! json=$(pack_dist_dynamic "$(pwd)/dist-dynamic" "$packDestination"); then
                 errors+=("${pluginPath}")
                 set -e
                 popd > /dev/null
